@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -9,53 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/charmbracelet/huh"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-// KubeConfig defines a minimal structure for kubeconfig files.
-type KubeConfig struct {
-	APIVersion     string         `yaml:"apiVersion"`
-	Kind           string         `yaml:"kind"`
-	Clusters       []NamedCluster `yaml:"clusters"`
-	Contexts       []NamedContext `yaml:"contexts"`
-	Users          []NamedUser    `yaml:"users"`
-	CurrentContext string         `yaml:"current-context"`
-}
-
-type NamedCluster struct {
-	Name    string  `yaml:"name"`
-	Cluster Cluster `yaml:"cluster"`
-}
-
-type Cluster struct {
-	Server                   string `yaml:"server"`
-	CertificateAuthorityData string `yaml:"certificate-authority-data,omitempty"`
-}
-
-type NamedContext struct {
-	Name    string  `yaml:"name"`
-	Context Context `yaml:"context"`
-}
-
-type Context struct {
-	Cluster string `yaml:"cluster"`
-	User    string `yaml:"user"`
-}
-
-type NamedUser struct {
-	Name string `yaml:"name"`
-	User User   `yaml:"user"`
-}
-
-type User struct {
-	Token                 string `yaml:"token,omitempty"`
-	ClientCertificateData string `yaml:"client-certificate-data,omitempty"`
-	ClientKeyData         string `yaml:"client-key-data,omitempty"`
-}
-
-// shorten returns a truncated version of a secret string: first 5 and last 5 characters.
+// shorten returns a truncated version of a secret string.
 func shorten(s string) string {
 	if len(s) <= 15 {
 		return s
@@ -63,13 +24,24 @@ func shorten(s string) string {
 	return fmt.Sprintf("%s...%s", s[:5], s[len(s)-5:])
 }
 
+// shortenBytes base64 encodes the byte slice before shortening.
+func shortenBytes(data []byte) string {
+	if len(data) == 0 {
+		return "<empty>"
+	}
+	s := base64.StdEncoding.EncodeToString(data)
+	if len(s) <= 15 {
+		return s
+	}
+	return fmt.Sprintf("%s...%s", s[:5], s[len(s)-5:])
+}
+
 func main() {
-	// Define command-line flags.
 	configPathFlag := flag.String("config", "~/.kube/config", "Path to kubeconfig file")
 	tryFlag := flag.Bool("try", false, "Try mode: do not update file, just print output")
 	flag.Parse()
 
-	// Expand "~" in the config path.
+	// Expand tilde in the config path
 	configPath := *configPathFlag
 	if strings.HasPrefix(configPath, "~") {
 		home, err := os.UserHomeDir()
@@ -80,27 +52,28 @@ func main() {
 		configPath = filepath.Join(home, configPath[1:])
 	}
 
-	// Read the existing kubeconfig.
+	// Read original kubeconfig content for backup
 	origData, err := ioutil.ReadFile(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading kubeconfig file %s: %v\n", configPath, err)
 		os.Exit(1)
 	}
-	var origCfg KubeConfig
-	if err := yaml.Unmarshal(origData, &origCfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing kubeconfig file: %v\n", err)
+
+	// Parse original kubeconfig
+	origCfg, err := clientcmd.Load(origData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing kubeconfig: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Gather context names from the current config.
+	// Gather context names
 	var contextNames []string
-	for _, ctx := range origCfg.Contexts {
-		contextNames = append(contextNames, ctx.Name)
+	for name := range origCfg.Contexts {
+		contextNames = append(contextNames, name)
 	}
-	// Allow creation of a new context.
 	contextNames = append(contextNames, "new context")
 
-	// Ask the user which context to update.
+	// Select context
 	var selectedContext string
 	err = huh.NewForm(
 		huh.NewGroup(
@@ -115,11 +88,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	var targetContext *NamedContext
+	var targetContextName string
+	var targetContext *api.Context
 	var newContext bool
+
 	if selectedContext == "new context" {
 		newContext = true
-		// For a new context, ask for context, cluster, and user names.
 		var newCtxName, newClusterName, newUserName string
 		err = huh.NewForm(
 			huh.NewGroup(
@@ -138,52 +112,43 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error getting new context details: %v\n", err)
 			os.Exit(1)
 		}
-		newCtx := NamedContext{
-			Name: newCtxName,
-			Context: Context{
-				Cluster: newClusterName,
-				User:    newUserName,
-			},
+
+		targetContextName = newCtxName // Set the target context name
+		origCfg.Contexts[targetContextName] = &api.Context{
+			Cluster:  newClusterName,
+			AuthInfo: newUserName,
 		}
-		origCfg.Contexts = append(origCfg.Contexts, newCtx)
-		targetContext = &origCfg.Contexts[len(origCfg.Contexts)-1]
+		targetContext = origCfg.Contexts[targetContextName] // Use the target context name
 	} else {
-		// Locate the selected context.
-		for i, ctx := range origCfg.Contexts {
-			if ctx.Name == selectedContext {
-				targetContext = &origCfg.Contexts[i]
-				break
-			}
-		}
+		targetContextName = selectedContext                 // Set the target context name
+		targetContext = origCfg.Contexts[targetContextName] // Use the target context name
 		if targetContext == nil {
 			fmt.Fprintf(os.Stderr, "Context %s not found\n", selectedContext)
 			os.Exit(1)
 		}
 	}
 
-	// For an existing context, ask if the server URL should be updated.
 	var updateServer bool
 	if !newContext {
 		err = huh.NewForm(
 			huh.NewGroup(
 				huh.NewConfirm().
-					Title(fmt.Sprintf("Do you want to update the server URL for cluster %s?", targetContext.Context.Cluster)).
+					Title(fmt.Sprintf("Update server URL for cluster %s?", targetContext.Cluster)).
 					Value(&updateServer),
 			),
 		).Run()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting confirmation for server update: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error getting server update confirmation: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	// Ask the user to paste a kubeconfig file.
-	// Set a larger height so that large files are not cut off.
+	// Get pasted kubeconfig
 	var pastedKubeconfig string
 	err = huh.NewForm(
 		huh.NewGroup(
 			huh.NewText().
-				Title("Paste kubeconfig file (press ctrl+d when done)").
+				Title("Paste kubeconfig (ctrl+d when done)").
 				CharLimit(99999).
 				Value(&pastedKubeconfig),
 		),
@@ -193,222 +158,139 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse the pasted kubeconfig.
-	var newCfg KubeConfig
-	if err := yaml.Unmarshal([]byte(pastedKubeconfig), &newCfg); err != nil {
+	newCfg, err := clientcmd.Load([]byte(pastedKubeconfig))
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing pasted kubeconfig: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Determine the target cluster name from the current (or new) context.
-	targetClusterName := targetContext.Context.Cluster
-
-	// Look for the target cluster in the pasted kubeconfig.
-	var pastedCluster *NamedCluster
-	for _, c := range newCfg.Clusters {
-		if c.Name == targetClusterName {
-			pastedCluster = &c
-			break
+	targetClusterName := targetContext.Cluster
+	pastedCluster, exists := newCfg.Clusters[targetClusterName]
+	if !exists {
+		var clusterOptions []string
+		for name := range newCfg.Clusters {
+			clusterOptions = append(clusterOptions, name)
 		}
-	}
-
-	// If not found, ask the user to select one from the pasted clusters.
-	if pastedCluster == nil {
-		var options []string
-		for _, c := range newCfg.Clusters {
-			options = append(options, c.Name)
-		}
-		var selectedPastedClusterName string
+		var selectedCluster string
 		err = huh.NewForm(
 			huh.NewGroup(
 				huh.NewSelect[string]().
-					Title("The pasted kubeconfig does not contain a cluster named " + targetClusterName + ". Select a cluster from the pasted file").
-					Options(huh.NewOptions(options...)...).
-					Value(&selectedPastedClusterName),
+					Title("Select cluster from pasted config").
+					Options(huh.NewOptions(clusterOptions...)...).
+					Value(&selectedCluster),
 			),
 		).Run()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error selecting cluster from pasted kubeconfig: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error selecting cluster: %v\n", err)
 			os.Exit(1)
 		}
-		// Now find the selected cluster.
-		for _, c := range newCfg.Clusters {
-			if c.Name == selectedPastedClusterName {
-				pastedCluster = &c
-				// Update the target context cluster name to the selected one.
-				targetContext.Context.Cluster = selectedPastedClusterName
-				break
-			}
-		}
-		if pastedCluster == nil {
-			fmt.Fprintf(os.Stderr, "Error: selected cluster not found in pasted kubeconfig\n")
-			os.Exit(1)
-		}
+		pastedCluster = newCfg.Clusters[selectedCluster]
+		targetContext.Cluster = selectedCluster
+		targetClusterName = selectedCluster
 	}
 
-	// Find in the pasted kubeconfig a context that uses the selected pasted cluster.
-	var pastedContext *NamedContext
-	for _, ctx := range newCfg.Contexts {
-		if ctx.Context.Cluster == pastedCluster.Name {
-			pastedContext = &ctx
+	var pastedContextName string
+	for name, ctx := range newCfg.Contexts {
+		if ctx.Cluster == targetClusterName {
+			pastedContextName = name
 			break
 		}
 	}
-	if pastedContext == nil {
-		// If no context references the cluster, ask the user to select one.
-		var options []string
-		for _, ctx := range newCfg.Contexts {
-			if ctx.Context.Cluster == pastedCluster.Name {
-				options = append(options, ctx.Name)
+	if pastedContextName == "" {
+		var ctxOptions []string
+		for name, ctx := range newCfg.Contexts {
+			if ctx.Cluster == targetClusterName {
+				ctxOptions = append(ctxOptions, name)
 			}
 		}
-		if len(options) == 0 {
-			fmt.Fprintf(os.Stderr, "Error: no context in pasted kubeconfig references cluster %q\n", pastedCluster.Name)
+		if len(ctxOptions) == 0 {
+			fmt.Fprintf(os.Stderr, "No contexts for cluster %s in pasted config\n", targetClusterName)
 			os.Exit(1)
 		}
-		var selectedPastedContextName string
 		err = huh.NewForm(
 			huh.NewGroup(
 				huh.NewSelect[string]().
-					Title(fmt.Sprintf("Select a context from pasted kubeconfig for cluster %q", pastedCluster.Name)).
-					Options(huh.NewOptions(options...)...).
-					Value(&selectedPastedContextName),
+					Title("Select context from pasted config").
+					Options(huh.NewOptions(ctxOptions...)...).
+					Value(&pastedContextName),
 			),
 		).Run()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error selecting context from pasted kubeconfig: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error selecting context: %v\n", err)
 			os.Exit(1)
 		}
-		for _, ctx := range newCfg.Contexts {
-			if ctx.Name == selectedPastedContextName {
-				pastedContext = &ctx
-				break
-			}
-		}
 	}
+	pastedContext := newCfg.Contexts[pastedContextName]
 
-	// Using the context from the pasted file, determine the corresponding user.
-	targetPastedUserName := pastedContext.Context.User
-	var pastedUser *NamedUser
-	for _, u := range newCfg.Users {
-		if u.Name == targetPastedUserName {
-			pastedUser = &u
-			break
+	pastedUser, exists := newCfg.AuthInfos[pastedContext.AuthInfo]
+	if !exists {
+		var userOptions []string
+		for name := range newCfg.AuthInfos {
+			userOptions = append(userOptions, name)
 		}
-	}
-	if pastedUser == nil {
-		// If no matching user is found, ask the user to select one.
-		var options []string
-		for _, u := range newCfg.Users {
-			options = append(options, u.Name)
-		}
-		var selectedPastedUserName string
+		var selectedUser string
 		err = huh.NewForm(
 			huh.NewGroup(
 				huh.NewSelect[string]().
-					Title("Select a user from the pasted kubeconfig").
-					Options(huh.NewOptions(options...)...).
-					Value(&selectedPastedUserName),
+					Title("Select user from pasted config").
+					Options(huh.NewOptions(userOptions...)...).
+					Value(&selectedUser),
 			),
 		).Run()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error selecting user from pasted kubeconfig: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error selecting user: %v\n", err)
 			os.Exit(1)
 		}
-		for _, u := range newCfg.Users {
-			if u.Name == selectedPastedUserName {
-				pastedUser = &u
-				break
-			}
-		}
-		if pastedUser == nil {
-			fmt.Fprintf(os.Stderr, "Error: selected user not found in pasted kubeconfig\n")
-			os.Exit(1)
-		}
+		pastedUser = newCfg.AuthInfos[selectedUser]
 	}
 
-	// Prepare to record changes.
 	var changes []string
 
-	// Update cluster information.
-	clusterUpdated := false
-	for i, c := range origCfg.Clusters {
-		if c.Name == targetContext.Context.Cluster {
-			// Compare and update certificate authority data.
-			oldCA := c.Cluster.CertificateAuthorityData
-			newCA := pastedCluster.Cluster.CertificateAuthorityData
-			if oldCA != newCA {
-				changes = append(changes, fmt.Sprintf("Updated cluster %q certificateAuthorityData from %s to %s",
-					c.Name, shorten(oldCA), shorten(newCA)))
-			}
-			// Update server if needed.
-			if newContext || updateServer {
-				oldServer := c.Cluster.Server
-				newServer := pastedCluster.Cluster.Server
-				if oldServer != newServer {
-					changes = append(changes, fmt.Sprintf("Updated cluster %q server from %s to %s",
-						c.Name, shorten(oldServer), shorten(newServer)))
-				}
-				origCfg.Clusters[i].Cluster.Server = newServer
-			}
-			origCfg.Clusters[i].Cluster.CertificateAuthorityData = newCA
-			clusterUpdated = true
-			break
+	// Update cluster
+	existingCluster, exists := origCfg.Clusters[targetClusterName]
+	if exists {
+		if (updateServer || newContext) && existingCluster.Server != pastedCluster.Server {
+			changes = append(changes, fmt.Sprintf("Updated cluster %q server from %s to %s",
+				targetClusterName, existingCluster.Server, pastedCluster.Server))
+			existingCluster.Server = pastedCluster.Server
 		}
-	}
-	if !clusterUpdated {
-		// If the cluster was not present, add it.
-		origCfg.Clusters = append(origCfg.Clusters, NamedCluster{
-			Name:    targetContext.Context.Cluster,
-			Cluster: pastedCluster.Cluster,
-		})
-		changes = append(changes, fmt.Sprintf("Added new cluster %q with server %s and certificateAuthorityData %s",
-			targetContext.Context.Cluster, shorten(pastedCluster.Cluster.Server), shorten(pastedCluster.Cluster.CertificateAuthorityData)))
-	}
-
-	// Update user information.
-	userUpdated := false
-	for i, u := range origCfg.Users {
-		if u.Name == targetContext.Context.User {
-			oldToken := u.User.Token
-			oldCert := u.User.ClientCertificateData
-			oldKey := u.User.ClientKeyData
-
-			newToken := pastedUser.User.Token
-			newCert := pastedUser.User.ClientCertificateData
-			newKey := pastedUser.User.ClientKeyData
-
-			if oldToken != newToken {
-				changes = append(changes, fmt.Sprintf("Updated user %q token from %s to %s", u.Name, shorten(oldToken), shorten(newToken)))
-			}
-			if oldCert != newCert {
-				changes = append(changes, fmt.Sprintf("Updated user %q clientCertificateData from %s to %s", u.Name, shorten(oldCert), shorten(newCert)))
-			}
-			if oldKey != newKey {
-				changes = append(changes, fmt.Sprintf("Updated user %q clientKeyData from %s to %s", u.Name, shorten(oldKey), shorten(newKey)))
-			}
-			origCfg.Users[i].User = pastedUser.User
-			userUpdated = true
-			break
+		if !bytes.Equal(existingCluster.CertificateAuthorityData, pastedCluster.CertificateAuthorityData) {
+			changes = append(changes, fmt.Sprintf("Updated cluster %q CA data from %s to %s",
+				targetClusterName, shortenBytes(existingCluster.CertificateAuthorityData), shortenBytes(pastedCluster.CertificateAuthorityData)))
+			existingCluster.CertificateAuthorityData = pastedCluster.CertificateAuthorityData
 		}
-	}
-	if !userUpdated {
-		origCfg.Users = append(origCfg.Users, NamedUser{
-			Name: targetContext.Context.User,
-			User: pastedUser.User,
-		})
-		changes = append(changes, fmt.Sprintf("Added new user %q with token %s, clientCertificateData %s, and clientKeyData %s",
-			targetContext.Context.User, shorten(pastedUser.User.Token), shorten(pastedUser.User.ClientCertificateData), shorten(pastedUser.User.ClientKeyData)))
+	} else {
+		origCfg.Clusters[targetClusterName] = pastedCluster
+		changes = append(changes, fmt.Sprintf("Added cluster %q with server %s and CA data %s",
+			targetClusterName, pastedCluster.Server, shortenBytes(pastedCluster.CertificateAuthorityData)))
 	}
 
-	// Marshal the updated configuration back to YAML.
-	outData, err := yaml.Marshal(&origCfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling updated kubeconfig: %v\n", err)
-		os.Exit(1)
+	// Update user
+	targetUserName := targetContext.AuthInfo
+	existingUser, exists := origCfg.AuthInfos[targetUserName]
+	if exists {
+		if existingUser.Token != pastedUser.Token {
+			changes = append(changes, fmt.Sprintf("Updated user %q token from %s to %s",
+				targetUserName, shorten(existingUser.Token), shorten(pastedUser.Token)))
+			existingUser.Token = pastedUser.Token
+		}
+		if !bytes.Equal(existingUser.ClientCertificateData, pastedUser.ClientCertificateData) {
+			changes = append(changes, fmt.Sprintf("Updated user %q client cert from %s to %s",
+				targetUserName, shortenBytes(existingUser.ClientCertificateData), shortenBytes(pastedUser.ClientCertificateData)))
+			existingUser.ClientCertificateData = pastedUser.ClientCertificateData
+		}
+		if !bytes.Equal(existingUser.ClientKeyData, pastedUser.ClientKeyData) {
+			changes = append(changes, fmt.Sprintf("Updated user %q client key from %s to %s",
+				targetUserName, shortenBytes(existingUser.ClientKeyData), shortenBytes(pastedUser.ClientKeyData)))
+			existingUser.ClientKeyData = pastedUser.ClientKeyData
+		}
+	} else {
+		origCfg.AuthInfos[targetUserName] = pastedUser
+		changes = append(changes, fmt.Sprintf("Added user %q with token %s, client cert %s, and client key %s",
+			targetUserName, shorten(pastedUser.Token), shortenBytes(pastedUser.ClientCertificateData), shortenBytes(pastedUser.ClientKeyData)))
 	}
 
-	// Print the summary of changes.
+	// Print changes
 	fmt.Println("Summary of changes:")
 	if len(changes) == 0 {
 		fmt.Println("No changes made.")
@@ -418,25 +300,35 @@ func main() {
 		}
 	}
 
-	// In try mode, simply print the updated configuration.
+	// Handle try mode
 	if *tryFlag {
+		outData, err := clientcmd.Write(*origCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error marshaling config: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println("\n---- Updated kubeconfig (try mode) ----")
 		fmt.Println(string(outData))
 		return
 	}
 
-	// Create a backup of the original file with a .backup.YYYYMMDD extension.
-	backupPath := fmt.Sprintf("%s.backup.%s", configPath, time.Now().Format("20060102"))
+	// Create backup
+	backupPath := fmt.Sprintf("%s.backup.%s", configPath, time.Now().Format(time.RFC3339))
 	if err := ioutil.WriteFile(backupPath, origData, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing backup file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating backup: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Backup of original kubeconfig saved as %s\n", backupPath)
+	fmt.Printf("Backup saved to %s\n", backupPath)
 
-	// Write the updated configuration back to the file.
-	if err := ioutil.WriteFile(configPath, outData, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing updated kubeconfig: %v\n", err)
+	// Write updated config
+	outData, err := clientcmd.Write(*origCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error marshaling updated config: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Kubeconfig updated successfully in %s\n", configPath)
+	if err := ioutil.WriteFile(configPath, outData, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing updated config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Successfully updated %s\n", configPath)
 }
