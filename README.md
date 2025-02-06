@@ -22,12 +22,15 @@ Run the tool using the default kubeconfig file (~/.kube/config):
 
 To specify a different kubeconfig file, use the `--config` flag:
 
+```bash
   ./kubeconfig-updater --config=/path/to/kubeconfig
-
+```
 
 To preview changes without updating the file, use the --try flag:
 
+```bash
   ./kubeconfig-updater --try
+```
 
 ## Example
 
